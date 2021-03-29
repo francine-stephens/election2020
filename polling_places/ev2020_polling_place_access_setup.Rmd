@@ -110,6 +110,7 @@ tx_counties_sf <- st_read(paste0(shapefiles_path,
 ```{r counties subset}
 tx_counties_top2_tiers_sf <- tx_counties_sf %>%
   filter(CNTY_NM %in% counties_in_top2_tiers$county_name) %>% 
+  select(1:2) %>%
   st_transform(., crs = txnad83)
 
 ```
@@ -132,7 +133,13 @@ tx_early_vote_2tiers_sf <- tx_early_vote_locations_csv %>%
          city,
          zip5,
          schedule
+         ) %>%
+  mutate(county_name = str_to_title(county_name),
+         county_name = if_else(county_name == "Mclennan",
+                               "McLennan",
+                               county_name)
          )
+saveRDS(tx_early_vote_2tiers_sf, "ev_locs_top2tiers.rds")
 
 ```
 
@@ -143,6 +150,14 @@ ev_locs_10_min_drive_iso <- mb_isochrone(tx_early_vote_2tiers_sf,
                                          time = 10) 
 saveRDS(ev_locs_10_min_drive_iso, "ev_toptier_10mindriveiso.rds")
 
+ev_10_min_drive_iso_locinfo <- tx_early_vote_2tiers_sf %>% 
+  st_set_geometry(NULL) %>% 
+  cbind(ev_locs_10_min_drive_iso$geometry) %>% 
+  st_as_sf() %>%
+  mutate(location_name = str_to_title(location_name),
+         city = str_to_title(city)
+) 
+
 ev_locs_10_min_drive_iso_info <- tx_early_vote_2tiers_sf %>% 
   st_set_geometry(NULL) %>% 
   cbind(ev_locs_10_min_drive_iso$geometry) %>% 
@@ -151,7 +166,7 @@ ev_locs_10_min_drive_iso_info <- tx_early_vote_2tiers_sf %>%
   summarize() %>%
   st_transform(., crs = txnad83) %>% 
   st_intersection(., tx_counties_top2_tiers_sf)
-
+saveRDS(ev_10_min_drive_iso_info, "ev_10_min_drive_iso_info.rds")
 
   ## Visualize ##
   leaflet() %>% 
@@ -160,7 +175,7 @@ ev_locs_10_min_drive_iso_info <- tx_early_vote_2tiers_sf %>%
       username = "mapbox"
     ) %>%
     addPolygons(
-      data = ev_locs_10_min_drive_iso_info %>%
+      data = ev_10_min_drive_iso_locinfo %>%
       st_transform(., crs = wgs),
       label = ~county_name
     ) %>% 
@@ -207,8 +222,9 @@ top2tierco_precincts_sf_wgeog_wlikelydem <-  top2tierco_precincts_sf %>%
   arrange(CNTY) %>% 
   mutate(orig_area_meters = st_area(.),
          orig_area_miles = as.numeric(set_units(orig_area_meters, mi^2)),
+         total_party = (likely_dems + likely_repubs),
          dem_density = likely_dems/orig_area_miles,
-         pct_likely_dem = (likely_dems/reg_voters) * 100
+         pct_likely_dem = (likely_dems/total_party) * 100
         ) %>%
   filter(county_name %in% counties_in_top2_tiers$county_name)
 
@@ -219,16 +235,28 @@ top2tierco_precincts_sf_wgeog_wrace <-  top2tierco_precincts_sf %>%
   arrange(CNTY) %>% 
   mutate(orig_area_meters = st_area(.),
          orig_area_miles = as.numeric(set_units(orig_area_meters, mi^2)),
-         nonwhite = (latinx + aapi + black + native),
-         nonwhite_density = nonwhite/orig_area_miles) %>%
+         poc = (latinx + aapi + black + native),
+         pct_poc = (poc/(white + latinx + aapi + black + native + missing) * 100)
+         ) %>%
   mutate_at(vars(latinx:native), funs("density" = . /orig_area_miles)) %>%
-  filter(county_name %in% counties_in_top2_tiers$county_name)
+  filter(county_name %in% counties_in_top2_tiers$county_name) %>%
+  st_set_geometry(NULL) %>%
+  select(dnc_id, poc, pct_poc)
+
+
+top2tierco_precincts_sf_voterdata <- top2tierco_precincts_sf_wgeog_wlikelydem %>% 
+  select(dnc_id, nearest_poll_distance_miles, county_name, dem_density, pct_likely_dem) %>%
+  left_join(., top2tierco_precincts_sf_wgeog_wrace, by = "dnc_id")
+saveRDS(top2tierco_precincts_sf_voterdata, "precinct_voter_data_top_counties.rds")
+
 
 ## LIKELY DEM
 ggplot(top2tierco_precincts_sf_wgeog_wlikelydem,
        aes(x = nearest_poll_distance_miles,
-           y = pct_likely_dem)) +
-  geom_point(size = 1) + theme_bw() + facet_wrap(~ county_name)
+           y = dem_density)
+       ) +
+  geom_point(size = 1) + 
+  theme_bw() + facet_wrap(~ county_name)
 
 ggplot(top2tierco_precincts_sf_wgeog_wrace,
        aes(x = nearest_poll_distance_miles,
@@ -279,10 +307,11 @@ polls_10_min_drive_iso_intersect_dem_total_served <- polls_10_min_drive_iso_inte
   mutate(perc_area = if_else(perc_area > 1,
                              1, 
                              perc_area)) %>%
-  mutate_at(vars(reg_voters:likely_dems), .funs = funs(. * perc_area)) %>%
+  mutate_at(vars(reg_voters:likely_repubs), .funs = funs(. * perc_area)) %>%
   group_by(county_name) %>% 
-  summarise(across(reg_voters:likely_dems, ~ sum(.x)))  %>%
-  mutate(pct_likely_dems = likely_dems/reg_voters) 
+  st_set_geometry(NULL) %>%
+  summarise(across(reg_voters:likely_repubs, ~ sum(.x))) %>%
+  mutate(total_party = likely_dems + likely_repubs)
 
 
 polls_10_min_drive_iso_intersect_race <- top2tierco_precincts_sf_wgeog_wrace %>% 
@@ -300,9 +329,51 @@ polls_10_min_drive_iso_intersect_race_total_served <- polls_10_min_drive_iso_int
   mutate(perc_area = if_else(perc_area > 1,
                              1, 
                              perc_area)) %>%
-  mutate_at(vars(reg_voters:missing), .funs = funs(. * perc_area)) %>%
+  mutate_at(vars(white:missing), .funs = funs(. * perc_area)) %>%
   group_by(county_name) %>% 
-  summarise(across(reg_voters:missing, ~ sum(.x)))  %>%
-  mutate_at(vars(white:missing), funs("percent" = (./reg_voters) * 100))
+  st_set_geometry(NULL) %>%
+  summarise(across(white:missing, ~ sum(.x)))
 
 ```
+
+
+```{r create totals for pop characteristics per county}
+partisanship_totals_by_county <- likely_partisanship_by_precinct %>% 
+  filter(county_name %in% counties_in_top2_tiers$county_name) %>%
+  group_by(county_name) %>% 
+  summarize(across(where(is.numeric), ~sum(.x))) %>%
+  rename_with(toupper, where(is.numeric)) %>%
+  mutate(TOTAL_PARTY = LIKELY_DEMS + LIKELY_REPUBS) %>%
+  select(-REG_VOTERS)
+
+voter_race_totals_by_county <- voter_race_by_precinct %>% 
+  filter(county_name %in% counties_in_top2_tiers$county_name) %>%
+  group_by(county_name) %>% 
+  summarize(across(where(is.numeric), ~sum(.x))) %>%
+  rename_with(toupper, where(is.numeric))
+
+all_voter_totals_by_county <- partisanship_totals_by_county %>%
+  left_join(., voter_race_totals_by_county, by = "county_name")
+
+
+polls_10min_drive_servarea_pop_served_countypop <- 
+  polls_10_min_drive_iso_intersect_dem_total_served %>%
+  left_join(., polls_10_min_drive_iso_intersect_race_total_served, by = "county_name") %>%
+  left_join(., all_voter_totals_by_county, by = "county_name")
+
+polls_10min_drive_servarea_share_county_pop <- 
+  polls_10min_drive_servarea_pop_served_countypop %>%
+  mutate(reg_voters_perc = (reg_voters/REG_VOTERS) * 100,
+         likely_dems_perc = (likely_dems/LIKELY_DEMS) * 100,
+         likely_repubs_perc = (likely_repubs/LIKELY_REPUBS) * 100,
+         white_voters_perc = (white/WHITE) * 100,
+         black_voters_perc = (black/BLACK) * 100,
+         latinx_voters_perc = (latinx/LATINX) * 100,
+         aapi_voters_perc = (aapi/AAPI) * 100, 
+         native_voters_perc = (native/NATIVE) * 100,
+         other_race_perc = (missing/MISSING) * 100
+         )
+
+
+```
+

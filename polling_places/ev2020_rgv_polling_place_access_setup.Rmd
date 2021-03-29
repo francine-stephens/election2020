@@ -1,0 +1,294 @@
+---
+title: "ev2020_RGV_pollling_place_access_setup"
+author: "Francine Stephens"
+date: "Last Updated: `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+    highlight: espresso
+---
+
+```{r setup, include=FALSE}
+#### SET-UP ####
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+## Libraries
+options(tidyverse.quiet = TRUE)
+packages <- c(
+  "readr",
+  "tidyverse",
+  "sf",
+  "RSocrata",
+  "ggplot2",
+  "leaflet",
+  "mapboxapi",
+  "scales",
+  "units",
+  "tmap",
+  "tigris",
+  "censusapi", 
+  "tidycensus",
+  "RColorBrewer"
+)
+lapply(packages, library, character.only = TRUE)
+options(dplyr.summarise.inform = FALSE)
+
+#### PATHS ####
+setwd("~/Projects/politics/election2020/polling_places")
+wd <- getwd()
+election2020_root_path <- "C:/Users/Franc/Documents/Projects/politics/election2020/"
+precinct_voter_data_path <- "C:/Users/Franc/Documents/Projects/politics/election2020/precinct_level_voter_data"
+shapefiles_path <- 
+  "C:/Users/Franc/Documents/Shapefile_Repository/tx_political_geography/shapefiles/"
+precincts_shapes_path <- "precincts/precincts_2020/"
+county_shapes_path <- "county/"
+
+#### PARAMETERS ####
+txnad83 <- 3083 # EPSG:3083 NAD83/ TX Albers EA
+wgs <- 4326
+rgv_plus <- c("Cameron", "Willacy", "Hidalgo", "Starr", "Jim Hogg", "Zapata", "Webb")
+
+```
+
+## Data Imports
+
+```{r ingest data, echo = FALSE}
+#### INGEST DATA ####
+tx_early_vote_locations_csv <- read_csv(paste0(wd, 
+                                               "/2020-11-03_early_vote_for_van_upload.csv")
+                            )
+
+likely_partisanship_by_precinct <- read_csv(paste0(precinct_voter_data_path, 
+                                                   "/person_likelydem_likelyrepub_precinct.csv"),
+                                            col_types = cols(.default = "c", 
+                                                             county_name = "c", 
+                                                             reg_voters = "d", 
+                                                             likely_dems = "d", 
+                                                             likely_repubs = "d", 
+                                                             dnc_precinct_id = "c", 
+                                                             van_precinct_id = "c", 
+                                                             van_precinct_name = "c")
+)
+
+voter_race_by_precinct <- read_csv(paste0(precinct_voter_data_path, 
+                                          "/person_race_precinct.csv"),
+                                            col_types = cols(.default = "c", 
+                                                             county_name = "c", 
+                                                             reg_voters = "d", 
+                                                             white = "d", 
+                                                             latinx = "d", 
+                                                             aapi = "d",
+                                                             black = "d",
+                                                             native = "d",
+                                                             missing = "d",
+                                                             dnc_precinct_id = "c", 
+                                                             van_precinct_id = "c", 
+                                                             van_precinct_name = "c")
+)
+
+
+tx_precincts_sf <- st_read(paste0(shapefiles_path, 
+                                  precincts_shapes_path, 
+                                  "precincts_2020.shp")
+                           )   # txnad83
+
+tx_counties_sf <- st_read(paste0(shapefiles_path, 
+                                 county_shapes_path, 
+                                 "Texas_County_Boundaries.shp")
+                         )   # wgs84
+
+
+```
+
+## Set-up Counties
+
+```{r counties subset}
+rgv_counties <- tx_counties_sf %>%
+  filter(CNTY_NM %in% rgv_plus) %>% 
+  select(1:2) %>%
+  st_transform(., crs = txnad83)
+
+```
+
+## Set-up Poll Locations
+
+```{r polling locations}
+rgv_ev_locs_sf <- tx_early_vote_locations_csv %>%
+  mutate(county_name = str_to_title(county_name)) %>%
+  filter(county_name %in% rgv_plus) %>%
+  st_as_sf(., coords=c("longitude", "latitude"), crs = wgs) %>%
+  st_transform(., crs = txnad83) %>%
+  select(id,
+         county_name,
+         county_fips,
+         location_name,
+         address_line1,
+         city,
+         zip5,
+         schedule
+         )
+
+```
+
+```{r isochrones around polling places}
+#### Construct Isochrones ####
+rgv_ev_locs_10_min_drive_iso <- mb_isochrone(rgv_ev_locs_sf, 
+                                         profile = "driving", 
+                                         time = 10) 
+
+rgv_ev_10_min_drive_iso_locinfo <- rgv_ev_locs_sf %>% 
+  st_set_geometry(NULL) %>% 
+  cbind(rgv_ev_locs_10_min_drive_iso$geometry) %>% 
+  st_as_sf() %>%
+  mutate(location_name = str_to_title(location_name),
+         city = str_to_title(city)
+) 
+
+rgv_ev_locs_10_min_drive_iso_info <- rgv_ev_locs_sf %>% 
+  st_set_geometry(NULL) %>% 
+  cbind(rgv_ev_locs_10_min_drive_iso$geometry) %>% 
+  st_as_sf() %>%
+  group_by(county_name) %>% 
+  summarize() %>%
+  st_transform(., crs = txnad83) %>% 
+  st_intersection(., rgv_counties)
+saveRDS(rgv_ev_10_min_drive_iso_info, "rgv_ev_10_min_drive_iso_info.rds")
+
+```
+
+## Set-up Precincts
+```{r manipulate precincts}
+rgv_precincts_sf <- tx_precincts_sf %>%
+  mutate(CNTY = paste0("48", CNTY), 
+         c_name = str_to_title(c_name)) %>%
+  filter(CNTY %in% rgv_counties$CNTY_FIPS | 
+         c_name %in% rgv_plus) %>%
+  mutate(dnc_id = as.character(dnc_id))
+
+rgv_precincts_points <- rgv_precincts_sf %>%
+  st_centroid() %>% 
+  st_transform(., crs = txnad83) %>%
+  mutate(nearest_poll = st_nearest_feature(., rgv_ev_locs_sf),
+         nearest_poll_distance = as.numeric(st_distance(.,
+                                                        rgv_ev_locs_sf[nearest_poll,], 
+                                                        by_element = TRUE)),
+         nearest_poll_distance_miles = nearest_poll_distance/1609) %>%
+  st_set_geometry(NULL) %>%
+    select(dnc_id, nearest_poll:nearest_poll_distance_miles)
+
+
+rgv_precincts_sf_wgeog_wlikelydem <-  rgv_precincts_sf %>% 
+  left_join(., rgv_precincts_points, by = "dnc_id") %>%
+  left_join(., likely_partisanship_by_precinct, by = c("dnc_id" = "dnc_precinct_id")) %>% 
+  filter(dnc_id != "0") %>%
+  arrange(CNTY) %>% 
+  mutate(orig_area_meters = st_area(.),
+         orig_area_miles = as.numeric(set_units(orig_area_meters, mi^2)),
+         total_party = (likely_dems + likely_repubs),
+         dem_density = likely_dems/orig_area_miles,
+         pct_likely_dem = (likely_dems/total_party) * 100
+        ) %>%
+  filter(county_name %in% rgv_plus)
+
+rgv_precincts_sf_wgeog_wrace <-  rgv_precincts_sf %>% 
+  left_join(., rgv_precincts_points, by = "dnc_id") %>%
+  left_join(., voter_race_by_precinct, by = c("dnc_id" = "dnc_precinct_id")) %>%
+  filter(dnc_id != "0") %>%
+  arrange(CNTY) %>% 
+  mutate(orig_area_meters = st_area(.),
+         orig_area_miles = as.numeric(set_units(orig_area_meters, mi^2)),
+         poc = (latinx + aapi + black + native),
+         pct_poc = (poc/(white + latinx + aapi + black + native + missing) * 100)
+         ) %>%
+  mutate_at(vars(latinx:native), funs("density" = . /orig_area_miles)) %>%
+  filter(county_name %in% rgv_plus) %>%
+  st_set_geometry(NULL) %>%
+  select(dnc_id, poc, pct_poc)
+
+
+rgv_precincts_sf_voterdata <- rgv_precincts_sf_wgeog_wlikelydem %>% 
+  select(dnc_id, nearest_poll_distance_miles, county_name, likely_dems,
+         dem_density, pct_likely_dem) %>%
+  left_join(., rgv_precincts_sf_wgeog_wrace, by = "dnc_id")
+saveRDS(rgv_precincts_sf_voterdata, "precinct_voter_data_top_counties.rds")
+
+
+## LIKELY DEM
+rgv_precincts_sf_wgeog_wlikelydem %>%
+  # filter(county_name == "Webb") %>% 
+  ggplot(.,
+       aes(x = nearest_poll_distance_miles,
+           y = pct_likely_dem)
+       ) +
+  geom_point(aes(size = likely_dems), 
+             color = "mediumblue",
+             position = position_jitter(w = 0.7, h = 0),
+             alpha = 0.5) +
+  theme_bw() + facet_wrap(~ county_name)
+
+ggplot(top2tierco_precincts_sf_wgeog_wrace,
+       aes(x = nearest_poll_distance_miles,
+           y = nonwhite_density)) +
+  geom_point(size = 1) + theme_bw() + facet_wrap(~ county_name)
+
+
+  ## Visualize ##
+  leaflet() %>% 
+    addMapboxTiles(
+      style_id = "streets-v11",
+      username = "mapbox"
+    ) %>%
+    addPolygons(
+      data = ev_locs_10_min_drive_iso_info %>%
+      st_transform(., crs = wgs),
+      label = ~county_name
+    ) %>% 
+    addCircles(
+      data = tx_early_vote_2tiers_sf %>% st_transform(., crs = wgs),
+      color = "red",
+      label = ~location_name 
+    ) %>%
+     addPolygons(
+      data = tx_counties_top2_tiers_sf %>%
+      st_transform(., crs = wgs),
+      color = "black", 
+      weight = 1, 
+      fill = FALSE,
+      label = ~CNTY_NM
+    )
+
+```
+
+
+### VISUALIZATION
+```{r visual of isochrones and locations}
+  ## Visualize ##
+  leaflet() %>% 
+    addMapboxTiles(
+      style_id = "streets-v11",
+      username = "mapbox"
+    ) %>%
+    addPolygons(
+      data = rgv_ev_locs_10_min_drive_iso_info %>%
+      st_transform(., crs = wgs),
+      color = "orange",
+      label = ~county_name
+    ) %>% 
+    addMarkers(
+      data = rgv_ev_locs_sf %>% st_transform(., crs = wgs), 
+      popup = ~as.character(location_name),
+      label = ~location_name 
+    ) %>%
+     addPolygons(
+      data = rgv_counties %>%
+      st_transform(., crs = wgs),
+      color = "black", 
+      weight = 1, 
+      fill = FALSE,
+      label = ~CNTY_NM
+    )
+
+```
